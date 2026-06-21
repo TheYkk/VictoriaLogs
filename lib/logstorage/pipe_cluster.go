@@ -3,6 +3,7 @@ package logstorage
 import (
 	"fmt"
 	"math"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -56,6 +57,26 @@ type pipeCluster struct {
 
 	// patternFieldName is the name of the field with the generated pattern per cluster.
 	patternFieldName string
+
+	// variables are user-defined named regexps. Substrings matching a variable regexp are
+	// replaced with the <name> placeholder before clustering, which reduces the number of
+	// clusters. This mirrors the -v option of the reference LogMine CLI.
+	variables []clusterVariable
+}
+
+// clusterVariable is a user-defined named regexp used to mask matching substrings before clustering.
+type clusterVariable struct {
+	// name is the variable name. Matching substrings are replaced with placeholder.
+	name string
+
+	// reStr is the original regexp string, used for String().
+	reStr string
+
+	// re is the compiled regexp.
+	re *regexp.Regexp
+
+	// placeholder is "<name>", precomputed once.
+	placeholder string
 }
 
 func (pc *pipeCluster) String() string {
@@ -73,15 +94,34 @@ func (pc *pipeCluster) String() string {
 	if pc.hitsFieldName != "hits" {
 		s += " hits as " + quoteTokenIfNeeded(pc.hitsFieldName)
 	}
+	if len(pc.variables) > 0 {
+		parts := make([]string, len(pc.variables))
+		for i, v := range pc.variables {
+			parts[i] = quoteTokenIfNeeded(v.name) + "=" + quoteTokenIfNeeded(v.reStr)
+		}
+		s += " variables (" + strings.Join(parts, ", ") + ")"
+	}
 	return s
 }
 
 func (pc *pipeCluster) splitToRemoteAndLocal(_ int64) (pipe, []pipe) {
-	// Phase 1: clustering needs a global view of all matching logs, and the
-	// per-node greedy result cannot be merged correctly without a dedicated
-	// merge pipe. So run the pipe locally on vlselect over all matching rows.
-	// Phase 2 will add a proper map-reduce split for cluster mode.
-	return nil, []pipe{pc}
+	// Distributed (cluster mode) execution is a map-reduce:
+	//   - the remote pipe clusters the logs locally on each vlstorage node and emits the
+	//     per-node clusters as (pattern, hits) rows. min_members is forced to 1 there, since
+	//     the global per-cluster counts are only known after merging all nodes.
+	//   - the local pipe (pipeClusterMerge) runs on vlselect, re-clusters the per-node
+	//     patterns into the final set, then applies min_members and the configured output.
+	// In single-node mode this split is not used and the pipe runs directly.
+	pRemote := *pc
+	pRemote.minMembers = pipeClusterDefaultMinMembers
+
+	pLocal := &pipeClusterMerge{
+		maxDist:          pc.maxDist,
+		minMembers:       pc.minMembers,
+		patternFieldName: pc.patternFieldName,
+		hitsFieldName:    pc.hitsFieldName,
+	}
+	return &pRemote, []pipe{pLocal}
 }
 
 func (pc *pipeCluster) canLiveTail() bool {
@@ -428,9 +468,16 @@ func (shard *pipeClusterProcessorShard) writeBlock(br *blockResult) {
 	}
 }
 
-// tokenizeMasked masks v via collapse_nums prettify and splits it into tokens by whitespace.
+// tokenizeMasked applies user variables and collapse_nums prettify to v, then splits it into
+// tokens by whitespace.
 func (shard *pipeClusterProcessorShard) tokenizeMasked(v string, dst []string) []string {
-	shard.maskBuf = appendCollapseNums(shard.maskBuf[:0], v)
+	src := v
+	if vars := shard.pc.variables; len(vars) > 0 {
+		for _, vr := range vars {
+			src = vr.re.ReplaceAllString(src, vr.placeholder)
+		}
+	}
+	shard.maskBuf = appendCollapseNums(shard.maskBuf[:0], src)
 	bLen := 0
 	shard.maskBuf = appendPrettifyCollapsedNums(shard.maskBuf[:bLen:cap(shard.maskBuf)], shard.maskBuf[bLen:])
 	masked := bytesutil.ToUnsafeString(shard.maskBuf)
@@ -563,7 +610,7 @@ func (pcp *pipeClusterProcessor) flush() error {
 	})
 
 	wctx := &pipeClusterWriteContext{
-		pcp: pcp,
+		ppNext: pcp.ppNext,
 	}
 	var rowFields []Field
 	minMembers := pcp.pc.minMembers
@@ -670,9 +717,9 @@ func clusterPatternString(tokens []patternToken) string {
 }
 
 type pipeClusterWriteContext struct {
-	pcp *pipeClusterProcessor
-	rcs []resultColumn
-	br  blockResult
+	ppNext pipeProcessor
+	rcs    []resultColumn
+	br     blockResult
 
 	rowsCount int
 	valuesLen int
@@ -720,7 +767,7 @@ func (wctx *pipeClusterWriteContext) flush() {
 
 	br.setResultColumns(rcs, wctx.rowsCount)
 	wctx.rowsCount = 0
-	wctx.pcp.ppNext.writeBlock(0, br)
+	wctx.ppNext.writeBlock(0, br)
 	br.reset()
 	for i := range rcs {
 		rcs[i].resetValues()
@@ -800,8 +847,64 @@ func parsePipeCluster(lex *lexer) (pipe, error) {
 				return nil, fmt.Errorf("cannot parse 'hits' name: %w", err)
 			}
 			pc.hitsFieldName = s
+		case lex.isKeyword("variables"):
+			vars, err := parseClusterVariables(lex)
+			if err != nil {
+				return nil, fmt.Errorf("cannot parse 'variables': %w", err)
+			}
+			pc.variables = vars
 		default:
 			return pc, nil
+		}
+	}
+}
+
+// parseClusterVariables parses 'variables (name1=regexp1, name2=regexp2, ...)'.
+func parseClusterVariables(lex *lexer) ([]clusterVariable, error) {
+	if !lex.isKeyword("variables") {
+		return nil, fmt.Errorf("expecting 'variables'; got %q", lex.token)
+	}
+	lex.nextToken()
+	if !lex.isKeyword("(") {
+		return nil, fmt.Errorf("missing '(' after 'variables'")
+	}
+	lex.nextToken()
+
+	var vars []clusterVariable
+	for {
+		if lex.isKeyword(")") {
+			return nil, fmt.Errorf("missing variable definition")
+		}
+		name, err := lex.nextCompoundToken()
+		if err != nil {
+			return nil, fmt.Errorf("cannot parse variable name: %w", err)
+		}
+		if !lex.isKeyword("=") {
+			return nil, fmt.Errorf("missing '=' after variable name %q", name)
+		}
+		lex.nextToken()
+		reStr, err := lex.nextCompoundToken()
+		if err != nil {
+			return nil, fmt.Errorf("cannot parse regexp for variable %q: %w", name, err)
+		}
+		re, err := regexpCompile(reStr)
+		if err != nil {
+			return nil, fmt.Errorf("cannot compile regexp %q for variable %q: %w", reStr, name, err)
+		}
+		vars = append(vars, clusterVariable{
+			name:        name,
+			reStr:       reStr,
+			re:          re,
+			placeholder: "<" + name + ">",
+		})
+		switch {
+		case lex.isKeyword(","):
+			lex.nextToken()
+		case lex.isKeyword(")"):
+			lex.nextToken()
+			return vars, nil
+		default:
+			return nil, fmt.Errorf("unexpected token %q after variable %q; want ',' or ')'", lex.token, name)
 		}
 	}
 }
