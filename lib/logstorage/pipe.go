@@ -203,6 +203,7 @@ func initPipeParsers() {
 	pipeParsers = map[string]pipeParseFunc{
 		"block_stats":       parsePipeBlockStats,
 		"blocks_count":      parsePipeBlocksCount,
+		"cluster":           parsePipeCluster,
 		"coalesce":          parsePipeCoalesce,
 		"collapse_nums":     parsePipeCollapseNums,
 		"copy":              parsePipeCopy,
@@ -231,6 +232,7 @@ func initPipeParsers() {
 		"last":              parsePipeLast,
 		"len":               parsePipeLen,
 		"limit":             parsePipeLimit,
+		"logmine":           parsePipeCluster,
 		"math":              parsePipeMath,
 		"mv":                parsePipeRename,
 		"offset":            parsePipeOffset,
